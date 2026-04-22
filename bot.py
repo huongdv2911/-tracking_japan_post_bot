@@ -22,6 +22,20 @@ CREATE TABLE IF NOT EXISTS trackings (
 """)
 conn.commit()
 
+# ===== AUTO MIGRATE =====
+def column_exists(column_name):
+    cursor.execute("PRAGMA table_info(trackings)")
+    columns = [col[1] for col in cursor.fetchall()]
+    return column_name in columns
+
+if not column_exists("user_id"):
+    cursor.execute("ALTER TABLE trackings ADD COLUMN user_id INTEGER")
+
+if not column_exists("username"):
+    cursor.execute("ALTER TABLE trackings ADD COLUMN username TEXT")
+
+conn.commit()
+
 
 # ===== CHECK JAPAN POST =====
 def get_tracking_status(tracking_number):
@@ -37,7 +51,10 @@ def get_tracking_status(tracking_number):
         res = requests.post(url, data=payload, timeout=15)
         text = res.text
 
-        if "お届け済み" in text or "お届け先にお届け済み" in text:
+        if "該当なし" in text or "お問い合わせ番号が見つかりません" in text:
+            return "NOT_FOUND"
+
+        if "お届け済み" in text:
             return "DELIVERED"
 
         return "IN_TRANSIT"
@@ -52,8 +69,8 @@ def get_tracking_status(tracking_number):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📦 Dùng lệnh:\n\n"
-        "/add <mã> - thêm đơn\n"
-        "/list - xem\n"
+        "/add <mã>\n"
+        "/list\n"
         "/remove <code>\n"
         "/removeall (admin)"
     )
@@ -62,6 +79,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ===== ADD =====
 async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
+    user = update.effective_user
 
     if not context.args:
         await update.message.reply_text("Dùng: /add <mã vận đơn>")
@@ -73,7 +91,6 @@ async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "SELECT * FROM trackings WHERE tracking_number=? AND chat_id=?",
         (tracking, chat_id)
     )
-
     if cursor.fetchone():
         await update.message.reply_text("⚠️ Đã tồn tại mã này")
         return
@@ -85,12 +102,14 @@ async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     cursor.execute(
-        "INSERT INTO trackings (tracking_number, chat_id, last_status) VALUES (?, ?, ?)",
-        (tracking, chat_id, status)
+        "INSERT INTO trackings (tracking_number, chat_id, user_id, username, last_status) VALUES (?, ?, ?, ?, ?)",
+        (tracking, chat_id, user.id, user.username, status)
     )
     conn.commit()
 
-    if status == "DELIVERED":
+    if status == "NOT_FOUND":
+        await update.message.reply_text(f"📦 {tracking}\n⚠️ Hệ thống chưa nhận đơn")
+    elif status == "DELIVERED":
         await update.message.reply_text(f"📦 {tracking}\n✅ Đã giao rồi")
     else:
         await update.message.reply_text(f"📦 {tracking}\n🚚 Đang vận chuyển\n🔔 Sẽ báo khi giao xong")
@@ -104,7 +123,6 @@ async def list_tracking(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "SELECT tracking_number, last_status FROM trackings WHERE chat_id=?",
         (chat_id,)
     )
-
     rows = cursor.fetchall()
 
     if not rows:
@@ -113,13 +131,19 @@ async def list_tracking(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     msg = "📦 Danh sách:\n\n"
     for t, s in rows:
-        status_text = "✅ Đã giao" if s == "DELIVERED" else "🚚 Đang đi"
+        if s == "DELIVERED":
+            status_text = "✅ Đã giao"
+        elif s == "NOT_FOUND":
+            status_text = "⚠️ Chưa nhận"
+        else:
+            status_text = "🚚 Đang đi"
+
         msg += f"{t} → {status_text}\n"
 
     await update.message.reply_text(msg)
 
 
-# ===== REMOVE 1 =====
+# ===== REMOVE =====
 async def remove_tracking(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
 
@@ -138,7 +162,7 @@ async def remove_tracking(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"🗑 Đã xoá {tracking}")
 
 
-# ===== REMOVE ALL (ADMIN ONLY) =====
+# ===== REMOVE ALL =====
 async def remove_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     user = update.effective_user
@@ -157,15 +181,31 @@ async def remove_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ===== JOB CHECK =====
 async def job_check(context: ContextTypes.DEFAULT_TYPE):
-    cursor.execute("SELECT id, tracking_number, chat_id, last_status FROM trackings")
+    cursor.execute(
+        "SELECT id, tracking_number, chat_id, user_id, username, last_status FROM trackings"
+    )
     rows = cursor.fetchall()
 
-    for row_id, tracking, chat_id, old_status in rows:
+    for row_id, tracking, chat_id, user_id, username, old_status in rows:
         new_status = get_tracking_status(tracking)
 
         if not new_status:
             continue
 
+        # ===== mới được tiếp nhận =====
+        if new_status == "IN_TRANSIT" and old_status == "NOT_FOUND":
+            cursor.execute(
+                "UPDATE trackings SET last_status=? WHERE id=?",
+                (new_status, row_id)
+            )
+            conn.commit()
+
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"📦 {tracking}\n📮 Đơn đã được tiếp nhận bởi Japan Post"
+            )
+
+        # ===== đã giao =====
         if new_status == "DELIVERED" and old_status != "DELIVERED":
             cursor.execute(
                 "UPDATE trackings SET last_status=? WHERE id=?",
@@ -173,13 +213,18 @@ async def job_check(context: ContextTypes.DEFAULT_TYPE):
             )
             conn.commit()
 
-            try:
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=f"📦 {tracking}\n🎉 ĐÃ GIAO HÀNG!"
-                )
-            except Exception as e:
-                print("Send error:", e)
+            if username:
+                tag = f"@{username}"
+                parse_mode = None
+            else:
+                tag = f"<a href='tg://user?id={user_id}'>Người dùng</a>"
+                parse_mode = "HTML"
+
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"📦 {tracking}\n🎉 ĐÃ GIAO HÀNG!\n👤 {tag}",
+                parse_mode=parse_mode
+            )
 
 
 # ===== MAIN =====
