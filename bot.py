@@ -57,6 +57,10 @@ def get_tracking_status(tracking_number):
         if "お届け済み" in text:
             return "DELIVERED"
 
+        # Giao lại
+        if "再配達" in text:
+            return "REDELIVERY"
+
         # Người nhận vắng mặt
         absent_keywords = [
             "ご不在",
@@ -127,7 +131,10 @@ async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"📦 {tracking}\n📭 Người nhận vắng mặt"
         )
-
+    elif status == "REDELIVERY":
+        await update.message.reply_text(
+            f"📦 {tracking}\n🔄 Đang giao lại"
+        )
     elif status == "DELIVERED":
         await update.message.reply_text(
             f"📦 {tracking}\n✅ Đã giao rồi"
@@ -157,7 +164,10 @@ async def list_tracking(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for t, s in rows:
         if s == "DELIVERED":
             status_text = "✅ Đã giao"
-
+            
+        elif s == "REDELIVERY":
+            status_text = "🔄 Đang giao lại"
+            
         elif s == "ABSENT":
             status_text = "📭 Người nhận vắng mặt"
 
@@ -235,30 +245,62 @@ async def job_check(context: ContextTypes.DEFAULT_TYPE):
             )
             # ===== người nhận vắng mặt =====
         if new_status == "ABSENT" and old_status != "ABSENT":
+```
+    # ===== người nhận vắng mặt =====
+    if new_status == "ABSENT" and old_status != "ABSENT":
 
-            cursor.execute(
-                "UPDATE trackings SET last_status=? WHERE id=?",
-                (new_status, row_id)
-            )
-            conn.commit()
+        cursor.execute(
+            "UPDATE trackings SET last_status=? WHERE id=?",
+            (new_status, row_id)
+        )
+        conn.commit()
 
-            if username:
-                tag = f"@{username}"
-                parse_mode = None
-            else:
-                tag = f"<a href='tg://user?id={user_id}'>Người dùng</a>"
-                parse_mode = "HTML"
+        if username:
+            tag = f"@{username}"
+            parse_mode = None
+        else:
+            tag = f"<a href='tg://user?id={user_id}'>Người dùng</a>"
+            parse_mode = "HTML"
 
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=(
-                    f"📦 {tracking}\n"
-                    f"📭 NGƯỜI NHẬN VẮNG MẶT\n"
-                    f"👤 {tag}\n\n"
-                    f"⚠️ Japan Post đã phát hàng nhưng không gặp người nhận."
-                ),
-                parse_mode=parse_mode
-            )
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                f"📦 {tracking}\n"
+                f"📭 NGƯỜI NHẬN VẮNG MẶT\n"
+                f"👤 {tag}\n\n"
+                f"⚠️ Japan Post đã phát hàng nhưng không gặp người nhận."
+            ),
+            parse_mode=parse_mode
+        )
+
+    # ===== giao lại =====
+    if new_status == "REDELIVERY" and old_status != "REDELIVERY":
+
+        cursor.execute(
+            "UPDATE trackings SET last_status=? WHERE id=?",
+            (new_status, row_id)
+        )
+        conn.commit()
+
+        if username:
+            tag = f"@{username}"
+            parse_mode = None
+        else:
+            tag = f"<a href='tg://user?id={user_id}'>Người dùng</a>"
+            parse_mode = "HTML"
+
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                f"📦 {tracking}\n"
+                f"🔄 ĐANG GIAO LẠI\n"
+                f"👤 {tag}\n\n"
+                f"📮 Japan Post đang thực hiện giao lại đơn hàng."
+            ),
+            parse_mode=parse_mode
+        )
+```
+
         # ===== đã giao =====
         if new_status == "DELIVERED" and old_status != "DELIVERED":
             cursor.execute(
