@@ -1,6 +1,6 @@
-import requests
-import sqlite3
 import os
+import sqlite3
+import requests
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
@@ -62,12 +62,7 @@ def get_tracking_status(tracking_number):
             return "REDELIVERY"
 
         # Người nhận vắng mặt
-        absent_keywords = [
-            "ご不在",
-            "持ち戻り",
-            "不在のため"
-        ]
-
+        absent_keywords = ["ご不在", "持ち戻り", "不在のため"]
         for keyword in absent_keywords:
             if keyword in text:
                 return "ABSENT"
@@ -80,7 +75,6 @@ def get_tracking_status(tracking_number):
 
 
 # ===== COMMANDS =====
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📦 Dùng lệnh:\n\n"
@@ -123,27 +117,15 @@ async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.commit()
 
     if status == "NOT_FOUND":
-        await update.message.reply_text(
-            f"📦 {tracking}\n⚠️ Hệ thống chưa nhận đơn"
-        )
-
+        await update.message.reply_text(f"📦 {tracking}\n⚠️ Hệ thống chưa nhận đơn")
     elif status == "ABSENT":
-        await update.message.reply_text(
-            f"📦 {tracking}\n📭 Người nhận vắng mặt"
-        )
+        await update.message.reply_text(f"📦 {tracking}\n📭 Người nhận vắng mặt")
     elif status == "REDELIVERY":
-        await update.message.reply_text(
-            f"📦 {tracking}\n🔄 Đang giao lại"
-        )
+        await update.message.reply_text(f"📦 {tracking}\n🔄 Đang giao lại")
     elif status == "DELIVERED":
-        await update.message.reply_text(
-            f"📦 {tracking}\n✅ Đã giao rồi"
-        )
-
+        await update.message.reply_text(f"📦 {tracking}\n✅ Đã giao rồi")
     else:
-        await update.message.reply_text(
-            f"📦 {tracking}\n🚚 Đang vận chuyển\n🔔 Sẽ báo khi giao xong"
-        )
+        await update.message.reply_text(f"📦 {tracking}\n🚚 Đang vận chuyển\n🔔 Sẽ báo khi giao xong")
 
 
 # ===== LIST =====
@@ -164,16 +146,12 @@ async def list_tracking(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for t, s in rows:
         if s == "DELIVERED":
             status_text = "✅ Đã giao"
-            
         elif s == "REDELIVERY":
             status_text = "🔄 Đang giao lại"
-            
         elif s == "ABSENT":
             status_text = "📭 Người nhận vắng mặt"
-
         elif s == "NOT_FOUND":
             status_text = "⚠️ Chưa nhận"
-
         else:
             status_text = "🚚 Đang đi"
 
@@ -228,33 +206,10 @@ async def job_check(context: ContextTypes.DEFAULT_TYPE):
     for row_id, tracking, chat_id, user_id, username, old_status in rows:
         new_status = get_tracking_status(tracking)
 
-        if not new_status:
+        if not new_status or new_status == old_status:
             continue
 
-        # ===== mới được tiếp nhận =====
-        if new_status == "IN_TRANSIT" and old_status == "NOT_FOUND":
-            cursor.execute(
-                "UPDATE trackings SET last_status=? WHERE id=?",
-                (new_status, row_id)
-            )
-            conn.commit()
-
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=f"📦 {tracking}\n📮 Đơn đã được tiếp nhận bởi Japan Post"
-            )
-            # ===== người nhận vắng mặt =====
-        if new_status == "ABSENT" and old_status != "ABSENT":
-```
-    # ===== người nhận vắng mặt =====
-    if new_status == "ABSENT" and old_status != "ABSENT":
-
-        cursor.execute(
-            "UPDATE trackings SET last_status=? WHERE id=?",
-            (new_status, row_id)
-        )
-        conn.commit()
-
+        # Thiết lập thẻ tag người dùng an toàn
         if username:
             tag = f"@{username}"
             parse_mode = None
@@ -262,69 +217,68 @@ async def job_check(context: ContextTypes.DEFAULT_TYPE):
             tag = f"<a href='tg://user?id={user_id}'>Người dùng</a>"
             parse_mode = "HTML"
 
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=(
+        is_updated = False
+        message_text = ""
+
+        # 1. Mới được tiếp nhận
+        if new_status == "IN_TRANSIT" and old_status == "NOT_FOUND":
+            message_text = f"📦 {tracking}\n📮 Đơn đã được tiếp nhận bởi Japan Post"
+            is_updated = True
+
+        # 2. Người nhận vắng mặt
+        elif new_status == "ABSENT":
+            message_text = (
                 f"📦 {tracking}\n"
                 f"📭 NGƯỜI NHẬN VẮNG MẶT\n"
                 f"👤 {tag}\n\n"
                 f"⚠️ Japan Post đã phát hàng nhưng không gặp người nhận."
-            ),
-            parse_mode=parse_mode
-        )
+            )
+            is_updated = True
 
-    # ===== giao lại =====
-    if new_status == "REDELIVERY" and old_status != "REDELIVERY":
-
-        cursor.execute(
-            "UPDATE trackings SET last_status=? WHERE id=?",
-            (new_status, row_id)
-        )
-        conn.commit()
-
-        if username:
-            tag = f"@{username}"
-            parse_mode = None
-        else:
-            tag = f"<a href='tg://user?id={user_id}'>Người dùng</a>"
-            parse_mode = "HTML"
-
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=(
+        # 3. Đang giao lại
+        elif new_status == "REDELIVERY":
+            message_text = (
                 f"📦 {tracking}\n"
                 f"🔄 ĐANG GIAO LẠI\n"
                 f"👤 {tag}\n\n"
                 f"📮 Japan Post đang thực hiện giao lại đơn hàng."
-            ),
-            parse_mode=parse_mode
-        )
-```
+            )
+            is_updated = True
 
-        # ===== đã giao =====
-        if new_status == "DELIVERED" and old_status != "DELIVERED":
+        # 4. Đã giao thành công
+        elif new_status == "DELIVERED":
+            message_text = f"📦 {tracking}\n🎉 ĐÃ GIAO HÀNG!\n👤 {tag}"
+            is_updated = True
+        
+        # 5. Các cập nhật trạng thái khác (ví dụ: chuyển từ ABSENT quay lại IN_TRANSIT)
+        else:
+            is_updated = True
+
+        # Tiến hành cập nhật DB và gửi tin nhắn nếu có thay đổi hợp lệ
+        if is_updated:
             cursor.execute(
                 "UPDATE trackings SET last_status=? WHERE id=?",
                 (new_status, row_id)
             )
             conn.commit()
 
-            if username:
-                tag = f"@{username}"
-                parse_mode = None
-            else:
-                tag = f"<a href='tg://user?id={user_id}'>Người dùng</a>"
-                parse_mode = "HTML"
-
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=f"📦 {tracking}\n🎉 ĐÃ GIAO HÀNG!\n👤 {tag}",
-                parse_mode=parse_mode
-            )
+            if message_text:
+                try:
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=message_text,
+                        parse_mode=parse_mode
+                    )
+                except Exception as send_err:
+                    print(f"Lỗi gửi tin nhắn cho chat_id {chat_id}: {send_err}")
 
 
 # ===== MAIN =====
 def main():
+    if not TOKEN:
+        print("❌ LỖI: Thiếu biến môi trường 'TOKEN'!")
+        return
+
     app = ApplicationBuilder().token(TOKEN)\
         .connect_timeout(30)\
         .read_timeout(30)\
