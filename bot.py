@@ -57,6 +57,17 @@ def get_tracking_status(tracking_number):
         if "お届け済み" in text:
             return "DELIVERED"
 
+        # Người nhận vắng mặt
+        absent_keywords = [
+            "ご不在",
+            "持ち戻り",
+            "不在のため"
+        ]
+
+        for keyword in absent_keywords:
+            if keyword in text:
+                return "ABSENT"
+
         return "IN_TRANSIT"
 
     except Exception as e:
@@ -108,11 +119,24 @@ async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.commit()
 
     if status == "NOT_FOUND":
-        await update.message.reply_text(f"📦 {tracking}\n⚠️ Hệ thống chưa nhận đơn")
+        await update.message.reply_text(
+            f"📦 {tracking}\n⚠️ Hệ thống chưa nhận đơn"
+        )
+
+    elif status == "ABSENT":
+        await update.message.reply_text(
+            f"📦 {tracking}\n📭 Người nhận vắng mặt"
+        )
+
     elif status == "DELIVERED":
-        await update.message.reply_text(f"📦 {tracking}\n✅ Đã giao rồi")
+        await update.message.reply_text(
+            f"📦 {tracking}\n✅ Đã giao rồi"
+        )
+
     else:
-        await update.message.reply_text(f"📦 {tracking}\n🚚 Đang vận chuyển\n🔔 Sẽ báo khi giao xong")
+        await update.message.reply_text(
+            f"📦 {tracking}\n🚚 Đang vận chuyển\n🔔 Sẽ báo khi giao xong"
+        )
 
 
 # ===== LIST =====
@@ -133,8 +157,13 @@ async def list_tracking(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for t, s in rows:
         if s == "DELIVERED":
             status_text = "✅ Đã giao"
+
+        elif s == "ABSENT":
+            status_text = "📭 Người nhận vắng mặt"
+
         elif s == "NOT_FOUND":
             status_text = "⚠️ Chưa nhận"
+
         else:
             status_text = "🚚 Đang đi"
 
@@ -204,7 +233,58 @@ async def job_check(context: ContextTypes.DEFAULT_TYPE):
                 chat_id=chat_id,
                 text=f"📦 {tracking}\n📮 Đơn đã được tiếp nhận bởi Japan Post"
             )
+        # ===== người nhận vắng mặt =====
+        if new_status == "ABSENT" and old_status != "ABSENT":
 
+            cursor.execute(
+                "UPDATE trackings SET last_status=? WHERE id=?",
+                (new_status, row_id)
+            )
+            conn.commit()
+
+            if username:
+                tag = f"@{username}"
+                parse_mode = None
+            else:
+                tag = f"<a href='tg://user?id={user_id}'>Người dùng</a>"
+                parse_mode = "HTML"
+
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    f"📦 {tracking}\n"
+                    f"📭 NGƯỜI NHẬN VẮNG MẶT\n"
+                    f"👤 {tag}\n\n"
+                    f"⚠️ Japan Post đã phát hàng nhưng không gặp người nhận."
+                ),
+                parse_mode=parse_mode
+            ) 
+            # ===== người nhận vắng mặt =====
+        if new_status == "ABSENT" and old_status != "ABSENT":
+
+            cursor.execute(
+                "UPDATE trackings SET last_status=? WHERE id=?",
+                (new_status, row_id)
+            )
+            conn.commit()
+
+            if username:
+                tag = f"@{username}"
+                parse_mode = None
+            else:
+                tag = f"<a href='tg://user?id={user_id}'>Người dùng</a>"
+                parse_mode = "HTML"
+
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    f"📦 {tracking}\n"
+                    f"📭 NGƯỜI NHẬN VẮNG MẶT\n"
+                    f"👤 {tag}\n\n"
+                    f"⚠️ Japan Post đã phát hàng nhưng không gặp người nhận."
+                ),
+                parse_mode=parse_mode
+            )
         # ===== đã giao =====
         if new_status == "DELIVERED" and old_status != "DELIVERED":
             cursor.execute(
