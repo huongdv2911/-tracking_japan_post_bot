@@ -233,32 +233,6 @@ async def job_check(context: ContextTypes.DEFAULT_TYPE):
                 chat_id=chat_id,
                 text=f"📦 {tracking}\n📮 Đơn đã được tiếp nhận bởi Japan Post"
             )
-        # ===== người nhận vắng mặt =====
-        if new_status == "ABSENT" and old_status != "ABSENT":
-
-            cursor.execute(
-                "UPDATE trackings SET last_status=? WHERE id=?",
-                (new_status, row_id)
-            )
-            conn.commit()
-
-            if username:
-                tag = f"@{username}"
-                parse_mode = None
-            else:
-                tag = f"<a href='tg://user?id={user_id}'>Người dùng</a>"
-                parse_mode = "HTML"
-
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=(
-                    f"📦 {tracking}\n"
-                    f"📭 NGƯỜI NHẬN VẮNG MẶT\n"
-                    f"👤 {tag}\n\n"
-                    f"⚠️ Japan Post đã phát hàng nhưng không gặp người nhận."
-                ),
-                parse_mode=parse_mode
-            ) 
             # ===== người nhận vắng mặt =====
         if new_status == "ABSENT" and old_status != "ABSENT":
 
