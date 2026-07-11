@@ -169,7 +169,7 @@ async def list_tracking(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg)
 
 
-# ===== REMOVE (HỖ TRỢ XÓA MỘT HOẶC NHIỀU MÃ CÙNG LÚC) =====
+# ===== REMOVE =====
 async def remove_tracking(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
 
@@ -308,7 +308,7 @@ async def job_check(context: ContextTypes.DEFAULT_TYPE):
 
 # ===== JOB CLEANUP (TỰ ĐỘNG XÓA ĐƠN ĐÃ GIAO ĐƯỢC 1 TUẦN) =====
 async def job_cleanup(context: ContextTypes.DEFAULT_TYPE):
-    # Tính mốc thời gian trước đây chính xác 7 ngày
+    # Tính mốc thời gian trước đây chính xác 7 days
     one_week_ago = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")
     
     # Tìm kiếm và xóa tận gốc các mã đơn có trạng thái DELIVERED cũ hơn 7 ngày
@@ -337,14 +337,16 @@ def main():
     app.add_handler(CommandHandler("remove", remove_tracking))
     app.add_handler(CommandHandler("removeall", remove_all))
 
-    # Vòng lặp quét bưu điện (30 phút / lần) như bản cũ
+    # Vòng lặp quét bưu điện (30 phút / lần)
     app.job_queue.run_repeating(job_check, interval=CHECK_INTERVAL, first=10)
     
     # Vòng lặp tự quét dọn dẹp hệ thống dữ liệu cũ (24 giờ / lần)
     app.job_queue.run_repeating(job_cleanup, interval=CLEANUP_INTERVAL, first=30)
 
     print("BOT RUNNING...")
-    app.run_polling()
+    
+    # Đã thêm tham số drop_pending_updates=True để gỡ hoàn toàn tình trạng kẹt session cũ
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
