@@ -1,18 +1,15 @@
 import os
 import sqlite3
 import requests
-from datetime import datetime, timedelta
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
 # ===== CONFIG =====
 TOKEN = os.getenv("TOKEN")
 CHECK_INTERVAL = 1800  # 30 phút
-CLEANUP_INTERVAL = 86400  # Chạy dọn dẹp mỗi 24 giờ (1 ngày)
 
 # ===== DATABASE =====
-# Đường dẫn đã được đồng bộ với ổ đĩa cố định Volume /data trên Railway
-conn = sqlite3.connect("/data/tracking.db", check_same_thread=False)
+conn = sqlite3.connect("tracking.db", check_same_thread=False)
 cursor = conn.cursor()
 
 cursor.execute("""
@@ -37,9 +34,6 @@ if not column_exists("user_id"):
 if not column_exists("username"):
     cursor.execute("ALTER TABLE trackings ADD COLUMN username TEXT")
 
-if not column_exists("delivered_at"):
-    cursor.execute("ALTER TABLE trackings ADD COLUMN delivered_at TEXT")
-
 conn.commit()
 
 
@@ -63,9 +57,11 @@ def get_tracking_status(tracking_number):
         if "お届け済み" in text:
             return "DELIVERED"
 
+        # Giao lại
         if "再配達" in text:
             return "REDELIVERY"
 
+        # Người nhận vắng mặt
         absent_keywords = ["ご不在", "持ち戻り", "不在のため"]
         for keyword in absent_keywords:
             if keyword in text:
@@ -84,7 +80,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📦 Dùng lệnh:\n\n"
         "/add <mã>\n"
         "/list\n"
-        "/remove <mã 1> <mã 2> ...\n"
+        "/remove <code>\n"
         "/removeall (admin)"
     )
 
@@ -114,12 +110,9 @@ async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Lỗi kiểm tra mã")
         return
 
-    # Nếu đơn đã giao từ trước, ghi nhận thời gian hiện tại để kích hoạt đếm ngược 1 tuần xóa đơn
-    delivered_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S") if status == "DELIVERED" else None
-
     cursor.execute(
-        "INSERT INTO trackings (tracking_number, chat_id, user_id, username, last_status, delivered_at) VALUES (?, ?, ?, ?, ?, ?)",
-        (tracking, chat_id, user.id, user.username, status, delivered_time)
+        "INSERT INTO trackings (tracking_number, chat_id, user_id, username, last_status) VALUES (?, ?, ?, ?, ?)",
+        (tracking, chat_id, user.id, user.username, status)
     )
     conn.commit()
 
@@ -130,8 +123,7 @@ async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif status == "REDELIVERY":
         await update.message.reply_text(f"📦 {tracking}\n🔄 Đang giao lại")
     elif status == "DELIVERED":
-        # Thông báo trực tiếp lúc add, hệ thống quét ngầm job_check sẽ bỏ qua không thông báo trùng lặp nữa
-        await update.message.reply_text(f"📦 {tracking}\n✅ Đã giao rồi\n⏱ Đơn cũ này sẽ tự động ẩn sau 1 tuần")
+        await update.message.reply_text(f"📦 {tracking}\n✅ Đã giao rồi")
     else:
         await update.message.reply_text(f"📦 {tracking}\n🚚 Đang vận chuyển\n🔔 Sẽ báo khi giao xong")
 
@@ -173,33 +165,18 @@ async def remove_tracking(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
 
     if not context.args:
-        await update.message.reply_text("Dùng: /remove <mã 1> <mã 2> ...")
+        await update.message.reply_text("Dùng: /remove <tracking>")
         return
 
-    trackings_to_remove = [t.strip() for t in context.args if t.strip()]
-    removed_list = []
-    
-    for tracking in trackings_to_remove:
-        cursor.execute(
-            "SELECT 1 FROM trackings WHERE tracking_number=? AND chat_id=?",
-            (tracking, chat_id)
-        )
-        if cursor.fetchone():
-            cursor.execute(
-                "DELETE FROM trackings WHERE tracking_number=? AND chat_id=?",
-                (tracking, chat_id)
-            )
-            removed_list.append(tracking)
-            
+    tracking = context.args[0]
+
+    cursor.execute(
+        "DELETE FROM trackings WHERE tracking_number=? AND chat_id=?",
+        (tracking, chat_id)
+    )
     conn.commit()
 
-    if not removed_list:
-        await update.message.reply_text("⚠️ Không tìm thấy mã nào trùng khớp trong danh sách của bạn để xóa.")
-    else:
-        msg = f"🗑 **Đã xóa thành công {len(removed_list)} mã vận đơn:**\n\n"
-        for t in removed_list:
-            msg += f"• `{t}`\n"
-        await update.message.reply_text(msg, parse_mode="Markdown")
+    await update.message.reply_text(f"🗑 Đã xoá {tracking}")
 
 
 # ===== REMOVE ALL =====
@@ -232,6 +209,7 @@ async def job_check(context: ContextTypes.DEFAULT_TYPE):
         if not new_status or new_status == old_status:
             continue
 
+        # Thiết lập thẻ tag người dùng an toàn
         if username:
             tag = f"@{username}"
             parse_mode = None
@@ -242,10 +220,12 @@ async def job_check(context: ContextTypes.DEFAULT_TYPE):
         is_updated = False
         message_text = ""
 
+        # 1. Mới được tiếp nhận
         if new_status == "IN_TRANSIT" and old_status == "NOT_FOUND":
             message_text = f"📦 {tracking}\n📮 Đơn đã được tiếp nhận bởi Japan Post"
             is_updated = True
 
+        # 2. Người nhận vắng mặt
         elif new_status == "ABSENT":
             message_text = (
                 f"📦 {tracking}\n"
@@ -255,6 +235,7 @@ async def job_check(context: ContextTypes.DEFAULT_TYPE):
             )
             is_updated = True
 
+        # 3. Đang giao lại
         elif new_status == "REDELIVERY":
             message_text = (
                 f"📦 {tracking}\n"
@@ -264,25 +245,21 @@ async def job_check(context: ContextTypes.DEFAULT_TYPE):
             )
             is_updated = True
 
+        # 4. Đã giao thành công
         elif new_status == "DELIVERED":
             message_text = f"📦 {tracking}\n🎉 ĐÃ GIAO HÀNG!\n👤 {tag}"
             is_updated = True
         
+        # 5. Các cập nhật trạng thái khác (ví dụ: chuyển từ ABSENT quay lại IN_TRANSIT)
         else:
             is_updated = True
 
+        # Tiến hành cập nhật DB và gửi tin nhắn nếu có thay đổi hợp lệ
         if is_updated:
-            if new_status == "DELIVERED":
-                now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                cursor.execute(
-                    "UPDATE trackings SET last_status=?, delivered_at=? WHERE id=?",
-                    (new_status, now_str, row_id)
-                )
-            else:
-                cursor.execute(
-                    "UPDATE trackings SET last_status=? WHERE id=?",
-                    (new_status, row_id)
-                )
+            cursor.execute(
+                "UPDATE trackings SET last_status=? WHERE id=?",
+                (new_status, row_id)
+            )
             conn.commit()
 
             if message_text:
@@ -294,17 +271,6 @@ async def job_check(context: ContextTypes.DEFAULT_TYPE):
                     )
                 except Exception as send_err:
                     print(f"Lỗi gửi tin nhắn cho chat_id {chat_id}: {send_err}")
-
-
-# ===== JOB CLEANUP =====
-async def job_cleanup(context: ContextTypes.DEFAULT_TYPE):
-    one_week_ago = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")
-    cursor.execute(
-        "DELETE FROM trackings WHERE last_status='DELIVERED' AND delivered_at <= ?",
-        (one_week_ago,)
-    )
-    conn.commit()
-    print("🤖 [Hệ thống] Đã tự động dọn dẹp các đơn giao thành công sau 1 tuần.")
 
 
 # ===== MAIN =====
@@ -325,7 +291,6 @@ def main():
     app.add_handler(CommandHandler("removeall", remove_all))
 
     app.job_queue.run_repeating(job_check, interval=CHECK_INTERVAL, first=10)
-    app.job_queue.run_repeating(job_cleanup, interval=CLEANUP_INTERVAL, first=30)
 
     print("BOT RUNNING...")
     app.run_polling()
