@@ -1,12 +1,14 @@
 import os
 import sqlite3
 import requests
+from datetime import datetime, timedelta
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
 # ===== CONFIG =====
 TOKEN = os.getenv("TOKEN")
 CHECK_INTERVAL = 1800  # 30 phút
+CLEANUP_INTERVAL = 86400  # Quét dọn dẹp mỗi 24 giờ (1 ngày)
 
 # ===== DATABASE =====
 conn = sqlite3.connect("tracking.db", check_same_thread=False)
@@ -33,6 +35,10 @@ if not column_exists("user_id"):
 
 if not column_exists("username"):
     cursor.execute("ALTER TABLE trackings ADD COLUMN username TEXT")
+
+# Tự động nâng cấp thêm cột lưu mốc thời gian giao hàng thành công
+if not column_exists("delivered_at"):
+    cursor.execute("ALTER TABLE trackings ADD COLUMN delivered_at TEXT")
 
 conn.commit()
 
@@ -80,7 +86,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📦 Dùng lệnh:\n\n"
         "/add <mã>\n"
         "/list\n"
-        "/remove <code>\n"
+        "/remove <mã 1> <mã 2> ... (Xóa một hoặc nhiều mã cùng lúc)\n"
         "/removeall (admin)"
     )
 
@@ -110,9 +116,12 @@ async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Lỗi kiểm tra mã")
         return
 
+    # Nếu mã add vào bưu điện báo đã giao luôn, ghi nhận ngày giờ hiện tại để đếm ngược 1 tuần xóa đơn
+    delivered_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S") if status == "DELIVERED" else None
+
     cursor.execute(
-        "INSERT INTO trackings (tracking_number, chat_id, user_id, username, last_status) VALUES (?, ?, ?, ?, ?)",
-        (tracking, chat_id, user.id, user.username, status)
+        "INSERT INTO trackings (tracking_number, chat_id, user_id, username, last_status, delivered_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (tracking, chat_id, user.id, user.username, status, delivered_time)
     )
     conn.commit()
 
@@ -123,7 +132,7 @@ async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif status == "REDELIVERY":
         await update.message.reply_text(f"📦 {tracking}\n🔄 Đang giao lại")
     elif status == "DELIVERED":
-        await update.message.reply_text(f"📦 {tracking}\n✅ Đã giao rồi")
+        await update.message.reply_text(f"📦 {tracking}\n✅ Đã giao rồi\n⏱ Đơn này sẽ tự động biến mất sau 1 tuần")
     else:
         await update.message.reply_text(f"📦 {tracking}\n🚚 Đang vận chuyển\n🔔 Sẽ báo khi giao xong")
 
@@ -160,23 +169,39 @@ async def list_tracking(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg)
 
 
-# ===== REMOVE =====
+# ===== REMOVE (HỖ TRỢ XÓA MỘT HOẶC NHIỀU MÃ CÙNG LÚC) =====
 async def remove_tracking(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
 
     if not context.args:
-        await update.message.reply_text("Dùng: /remove <tracking>")
+        await update.message.reply_text("Dùng: /remove <mã 1> <mã 2> ...")
         return
 
-    tracking = context.args[0]
-
-    cursor.execute(
-        "DELETE FROM trackings WHERE tracking_number=? AND chat_id=?",
-        (tracking, chat_id)
-    )
+    # Lấy toàn bộ danh sách mã được truyền vào sau lệnh, dọn dẹp khoảng trắng thừa
+    trackings_to_remove = [t.strip() for t in context.args if t.strip()]
+    removed_list = []
+    
+    for tracking in trackings_to_remove:
+        cursor.execute(
+            "SELECT 1 FROM trackings WHERE tracking_number=? AND chat_id=?",
+            (tracking, chat_id)
+        )
+        if cursor.fetchone():
+            cursor.execute(
+                "DELETE FROM trackings WHERE tracking_number=? AND chat_id=?",
+                (tracking, chat_id)
+            )
+            removed_list.append(tracking)
+            
     conn.commit()
 
-    await update.message.reply_text(f"🗑 Đã xoá {tracking}")
+    if not removed_list:
+        await update.message.reply_text("⚠️ Không tìm thấy mã nào trùng khớp trong danh sách của bạn để xóa.")
+    else:
+        msg = f"🗑 **Đã xóa thành công {len(removed_list)} mã vận đơn:**\n\n"
+        for t in removed_list:
+            msg += f"• `{t}`\n"
+        await update.message.reply_text(msg, parse_mode="Markdown")
 
 
 # ===== REMOVE ALL =====
@@ -250,16 +275,24 @@ async def job_check(context: ContextTypes.DEFAULT_TYPE):
             message_text = f"📦 {tracking}\n🎉 ĐÃ GIAO HÀNG!\n👤 {tag}"
             is_updated = True
         
-        # 5. Các cập nhật trạng thái khác (ví dụ: chuyển từ ABSENT quay lại IN_TRANSIT)
+        # 5. Các cập nhật trạng thái khác
         else:
             is_updated = True
 
         # Tiến hành cập nhật DB và gửi tin nhắn nếu có thay đổi hợp lệ
         if is_updated:
-            cursor.execute(
-                "UPDATE trackings SET last_status=? WHERE id=?",
-                (new_status, row_id)
-            )
+            # Nếu trạng thái chuyển sang DELIVERED trong khi quét ngầm, ghi nhận mốc thời gian hiện tại
+            if new_status == "DELIVERED":
+                now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                cursor.execute(
+                    "UPDATE trackings SET last_status=?, delivered_at=? WHERE id=?",
+                    (new_status, now_str, row_id)
+                )
+            else:
+                cursor.execute(
+                    "UPDATE trackings SET last_status=? WHERE id=?",
+                    (new_status, row_id)
+                )
             conn.commit()
 
             if message_text:
@@ -271,6 +304,20 @@ async def job_check(context: ContextTypes.DEFAULT_TYPE):
                     )
                 except Exception as send_err:
                     print(f"Lỗi gửi tin nhắn cho chat_id {chat_id}: {send_err}")
+
+
+# ===== JOB CLEANUP (TỰ ĐỘNG XÓA ĐƠN ĐÃ GIAO ĐƯỢC 1 TUẦN) =====
+async def job_cleanup(context: ContextTypes.DEFAULT_TYPE):
+    # Tính mốc thời gian trước đây chính xác 7 ngày
+    one_week_ago = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")
+    
+    # Tìm kiếm và xóa tận gốc các mã đơn có trạng thái DELIVERED cũ hơn 7 ngày
+    cursor.execute(
+        "DELETE FROM trackings WHERE last_status='DELIVERED' AND delivered_at <= ?",
+        (one_week_ago,)
+    )
+    conn.commit()
+    print("🤖 [Hệ thống] Đã tự động dọn dẹp các đơn hàng giao thành công sau 1 tuần.")
 
 
 # ===== MAIN =====
@@ -290,7 +337,11 @@ def main():
     app.add_handler(CommandHandler("remove", remove_tracking))
     app.add_handler(CommandHandler("removeall", remove_all))
 
+    # Vòng lặp quét bưu điện (30 phút / lần) như bản cũ
     app.job_queue.run_repeating(job_check, interval=CHECK_INTERVAL, first=10)
+    
+    # Vòng lặp tự quét dọn dẹp hệ thống dữ liệu cũ (24 giờ / lần)
+    app.job_queue.run_repeating(job_cleanup, interval=CLEANUP_INTERVAL, first=30)
 
     print("BOT RUNNING...")
     app.run_polling()
