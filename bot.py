@@ -1,47 +1,50 @@
 import os
-import sqlite3
 import requests
 from datetime import datetime, timedelta
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+import psycopg2
+from contextlib import contextmanager
 
 # ===== CONFIG =====
 TOKEN = os.getenv("TOKEN")
+DATABASE_URL = os.getenv("DATABASE_URL")
+if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
 CHECK_INTERVAL = 1800  # 30 phút
 CLEANUP_INTERVAL = 86400  # Quét dọn dẹp mỗi 24 giờ (1 ngày)
 
 # ===== DATABASE =====
-conn = sqlite3.connect("tracking.db", check_same_thread=False)
-cursor = conn.cursor()
+@contextmanager
+def get_db():
+    if not DATABASE_URL:
+        raise ValueError("DATABASE_URL environment variable is missing!")
+    conn = psycopg2.connect(DATABASE_URL)
+    try:
+        yield conn
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        raise e
+    finally:
+        conn.close()
 
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS trackings (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    tracking_number TEXT,
-    chat_id INTEGER,
-    last_status TEXT
-)
-""")
-conn.commit()
-
-# ===== AUTO MIGRATE =====
-def column_exists(column_name):
-    cursor.execute("PRAGMA table_info(trackings)")
-    columns = [col[1] for col in cursor.fetchall()]
-    return column_name in columns
-
-if not column_exists("user_id"):
-    cursor.execute("ALTER TABLE trackings ADD COLUMN user_id INTEGER")
-
-if not column_exists("username"):
-    cursor.execute("ALTER TABLE trackings ADD COLUMN username TEXT")
-
-# Tự động nâng cấp thêm cột lưu mốc thời gian giao hàng thành công
-if not column_exists("delivered_at"):
-    cursor.execute("ALTER TABLE trackings ADD COLUMN delivered_at TEXT")
-
-conn.commit()
-
+def init_db():
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("""
+            CREATE TABLE IF NOT EXISTS trackings (
+                id SERIAL PRIMARY KEY,
+                tracking_number VARCHAR(255),
+                chat_id BIGINT,
+                last_status VARCHAR(255)
+            );
+            """)
+            # Tự động nâng cấp thêm cột nếu chưa có (PostgreSQL hỗ trợ ADD COLUMN IF NOT EXISTS)
+            cursor.execute("ALTER TABLE trackings ADD COLUMN IF NOT EXISTS user_id BIGINT;")
+            cursor.execute("ALTER TABLE trackings ADD COLUMN IF NOT EXISTS username VARCHAR(255);")
+            cursor.execute("ALTER TABLE trackings ADD COLUMN IF NOT EXISTS delivered_at VARCHAR(255);")
 
 # ===== CHECK JAPAN POST =====
 def get_tracking_status(tracking_number):
@@ -102,11 +105,20 @@ async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     tracking = context.args[0].strip().replace(" ", "")
 
-    cursor.execute(
-        "SELECT * FROM trackings WHERE tracking_number=? AND chat_id=?",
-        (tracking, chat_id)
-    )
-    if cursor.fetchone():
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "SELECT 1 FROM trackings WHERE tracking_number = %s AND chat_id = %s",
+                    (tracking, chat_id)
+                )
+                exists = cursor.fetchone()
+    except Exception as db_err:
+        print(f"Lỗi truy vấn DB: {db_err}")
+        await update.message.reply_text("❌ Lỗi kiểm tra cơ sở dữ liệu")
+        return
+
+    if exists:
         await update.message.reply_text("⚠️ Đã tồn tại mã này")
         return
 
@@ -119,11 +131,18 @@ async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Nếu mã add vào bưu điện báo đã giao luôn, ghi nhận ngày giờ hiện tại để đếm ngược 1 tuần xóa đơn
     delivered_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S") if status == "DELIVERED" else None
 
-    cursor.execute(
-        "INSERT INTO trackings (tracking_number, chat_id, user_id, username, last_status, delivered_at) VALUES (?, ?, ?, ?, ?, ?)",
-        (tracking, chat_id, user.id, user.username, status, delivered_time)
-    )
-    conn.commit()
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "INSERT INTO trackings (tracking_number, chat_id, user_id, username, last_status, delivered_at) "
+                    "VALUES (%s, %s, %s, %s, %s, %s)",
+                    (tracking, chat_id, user.id, user.username, status, delivered_time)
+                )
+    except Exception as db_err:
+        print(f"Lỗi chèn DB: {db_err}")
+        await update.message.reply_text("❌ Lỗi lưu thông tin vào cơ sở dữ liệu")
+        return
 
     if status == "NOT_FOUND":
         await update.message.reply_text(f"📦 {tracking}\n⚠️ Hệ thống chưa nhận đơn")
@@ -141,11 +160,18 @@ async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def list_tracking(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
 
-    cursor.execute(
-        "SELECT tracking_number, last_status FROM trackings WHERE chat_id=?",
-        (chat_id,)
-    )
-    rows = cursor.fetchall()
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "SELECT tracking_number, last_status FROM trackings WHERE chat_id = %s",
+                    (chat_id,)
+                )
+                rows = cursor.fetchall()
+    except Exception as db_err:
+        print(f"Lỗi truy vấn danh sách: {db_err}")
+        await update.message.reply_text("❌ Lỗi truy xuất cơ sở dữ liệu")
+        return
 
     if not rows:
         await update.message.reply_text("📭 Không có đơn nào")
@@ -181,19 +207,24 @@ async def remove_tracking(update: Update, context: ContextTypes.DEFAULT_TYPE):
     trackings_to_remove = [t.strip() for t in context.args if t.strip()]
     removed_list = []
     
-    for tracking in trackings_to_remove:
-        cursor.execute(
-            "SELECT 1 FROM trackings WHERE tracking_number=? AND chat_id=?",
-            (tracking, chat_id)
-        )
-        if cursor.fetchone():
-            cursor.execute(
-                "DELETE FROM trackings WHERE tracking_number=? AND chat_id=?",
-                (tracking, chat_id)
-            )
-            removed_list.append(tracking)
-            
-    conn.commit()
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cursor:
+                for tracking in trackings_to_remove:
+                    cursor.execute(
+                        "SELECT 1 FROM trackings WHERE tracking_number = %s AND chat_id = %s",
+                        (tracking, chat_id)
+                    )
+                    if cursor.fetchone():
+                        cursor.execute(
+                            "DELETE FROM trackings WHERE tracking_number = %s AND chat_id = %s",
+                            (tracking, chat_id)
+                        )
+                        removed_list.append(tracking)
+    except Exception as db_err:
+        print(f"Lỗi xóa tracking: {db_err}")
+        await update.message.reply_text("❌ Lỗi khi xóa mã vận đơn trong cơ sở dữ liệu")
+        return
 
     if not removed_list:
         await update.message.reply_text("⚠️ Không tìm thấy mã nào trùng khớp trong danh sách của bạn để xóa.")
@@ -215,18 +246,31 @@ async def remove_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Chỉ admin mới dùng lệnh này")
         return
 
-    cursor.execute("DELETE FROM trackings WHERE chat_id=?", (chat.id,))
-    conn.commit()
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("DELETE FROM trackings WHERE chat_id = %s", (chat.id,))
+    except Exception as db_err:
+        print(f"Lỗi xóa tất cả: {db_err}")
+        await update.message.reply_text("❌ Lỗi khi xóa toàn bộ tracking")
+        return
 
     await update.message.reply_text("🗑 Đã xoá toàn bộ tracking")
 
 
 # ===== JOB CHECK =====
 async def job_check(context: ContextTypes.DEFAULT_TYPE):
-    cursor.execute(
-        "SELECT id, tracking_number, chat_id, user_id, username, last_status FROM trackings"
-    )
-    rows = cursor.fetchall()
+    # Lấy nhanh toàn bộ mã để tránh giữ transaction hoặc connection quá lâu khi thực hiện HTTP request
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "SELECT id, tracking_number, chat_id, user_id, username, last_status FROM trackings"
+                )
+                rows = cursor.fetchall()
+    except Exception as e:
+        print(f"Lỗi truy vấn job_check: {e}")
+        return
 
     for row_id, tracking, chat_id, user_id, username, old_status in rows:
         new_status = get_tracking_status(tracking)
@@ -281,19 +325,24 @@ async def job_check(context: ContextTypes.DEFAULT_TYPE):
 
         # Tiến hành cập nhật DB và gửi tin nhắn nếu có thay đổi hợp lệ
         if is_updated:
-            # Nếu trạng thái chuyển sang DELIVERED trong khi quét ngầm, ghi nhận mốc thời gian hiện tại
-            if new_status == "DELIVERED":
-                now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                cursor.execute(
-                    "UPDATE trackings SET last_status=?, delivered_at=? WHERE id=?",
-                    (new_status, now_str, row_id)
-                )
-            else:
-                cursor.execute(
-                    "UPDATE trackings SET last_status=? WHERE id=?",
-                    (new_status, row_id)
-                )
-            conn.commit()
+            try:
+                # Thực hiện cập nhật DB trên transaction rất ngắn
+                with get_db() as conn:
+                    with conn.cursor() as cursor:
+                        if new_status == "DELIVERED":
+                            now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                            cursor.execute(
+                                "UPDATE trackings SET last_status = %s, delivered_at = %s WHERE id = %s",
+                                (new_status, now_str, row_id)
+                            )
+                        else:
+                            cursor.execute(
+                                "UPDATE trackings SET last_status = %s WHERE id = %s",
+                                (new_status, row_id)
+                            )
+            except Exception as db_err:
+                print(f"Lỗi cập nhật DB cho {tracking}: {db_err}")
+                continue
 
             if message_text:
                 try:
@@ -308,22 +357,33 @@ async def job_check(context: ContextTypes.DEFAULT_TYPE):
 
 # ===== JOB CLEANUP (TỰ ĐỘNG XÓA ĐƠN ĐÃ GIAO ĐƯỢC 1 TUẦN) =====
 async def job_cleanup(context: ContextTypes.DEFAULT_TYPE):
-    # Tính mốc thời gian trước đây chính xác 7 days
+    # Tính mốc thời gian trước đây chính xác 7 ngày
     one_week_ago = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")
     
-    # Tìm kiếm và xóa tận gốc các mã đơn có trạng thái DELIVERED cũ hơn 7 ngày
-    cursor.execute(
-        "DELETE FROM trackings WHERE last_status='DELIVERED' AND delivered_at <= ?",
-        (one_week_ago,)
-    )
-    conn.commit()
-    print("🤖 [Hệ thống] Đã tự động dọn dẹp các đơn hàng giao thành công sau 1 tuần.")
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "DELETE FROM trackings WHERE last_status = 'DELIVERED' AND delivered_at <= %s",
+                    (one_week_ago,)
+                )
+        print("🤖 [Hệ thống] Đã tự động dọn dẹp các đơn hàng giao thành công sau 1 tuần.")
+    except Exception as e:
+        print(f"Lỗi dọn dẹp database: {e}")
 
 
 # ===== MAIN =====
 def main():
     if not TOKEN:
         print("❌ LỖI: Thiếu biến môi trường 'TOKEN'!")
+        return
+
+    # Khởi tạo db
+    try:
+        init_db()
+        print("✅ DATABASE INITIALIZED SUCCESSFULLY")
+    except Exception as db_err:
+        print(f"❌ LỖI KHỞI TẠO DATABASE: {db_err}")
         return
 
     app = ApplicationBuilder().token(TOKEN)\
